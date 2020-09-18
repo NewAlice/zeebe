@@ -14,9 +14,11 @@ import io.zeebe.model.bpmn.Bpmn;
 import io.zeebe.model.bpmn.BpmnModelInstance;
 import io.zeebe.test.UpgradeTestCase.TestCaseBuilder;
 import io.zeebe.test.util.TestUtil;
+import io.zeebe.util.FileUtil;
 import io.zeebe.util.VersionUtil;
 import io.zeebe.util.collection.Tuple;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.Arrays;
@@ -25,7 +27,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import org.agrona.IoUtil;
-import org.assertj.core.util.Files;
+import org.awaitility.Awaitility;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.RuleChain;
@@ -100,6 +102,42 @@ public class UpgradeTest {
                 .afterUpgrade(UpgradeTest::publishMessage)
                 .done()
           },
+          // TODO (saig0): enable the test case when upgrading from 0.25.0
+          // - an upgrade from 0.24.0 is not possible because a bug fix (#4959) causes an issue in
+          // the reprocessing (#5268)
+          //          {
+          //            "message event sub-process",
+          //            scenario()
+          //                .deployWorkflow(
+          //                    Bpmn.createExecutableProcess(PROCESS_ID)
+          //                        .eventSubProcess(
+          //                            "event-subprocess",
+          //                            eventSubProcess ->
+          //                                eventSubProcess
+          //                                    .startEvent()
+          //                                    .message(
+          //                                        m ->
+          // m.name(MESSAGE).zeebeCorrelationKeyExpression("key"))
+          //                                    .interrupting(false)
+          //                                    .endEvent())
+          //                        .startEvent()
+          //                        .serviceTask(TASK, t -> t.zeebeJobType(TASK))
+          //                        .endEvent()
+          //                        .done())
+          //                .createInstance(Map.of("key", "123"))
+          //                .beforeUpgrade(
+          //                    state -> {
+          //                      publishMessage(state, -1L, -1L);
+          //
+          //                      TestUtil.waitUntil(
+          //                          () -> state.hasElementInState("event-subprocess",
+          // "ELEMENT_COMPLETED"));
+          //
+          //                      return activateJob(state);
+          //                    })
+          //                .afterUpgrade(UpgradeTest::completeJob)
+          //                .done()
+          //          },
           {
             "timer",
             scenario()
@@ -148,11 +186,69 @@ public class UpgradeTest {
                 .createInstance()
                 .afterUpgrade(
                     (state, wfKey, key) -> {
-                      final var jobKey = activateJob(state);
-                      completeJob(state, wfKey, jobKey);
+                      TestUtil.waitUntil(() -> state.hasElementInState(JOB, "CREATED"));
+
+                      final var jobsResponse =
+                          state
+                              .client()
+                              .newActivateJobsCommand()
+                              .jobType(TASK)
+                              .maxJobsToActivate(1)
+                              .send()
+                              .join();
+                      assertThat(jobsResponse.getJobs()).hasSize(1);
+
+                      TestUtil.waitUntil(() -> state.hasElementInState(JOB, "ACTIVATED"));
+
+                      state
+                          .client()
+                          .newCompleteCommand(jobsResponse.getJobs().get(0).getKey())
+                          .send()
+                          .join();
                       TestUtil.waitUntil(
                           () -> state.hasLogContaining(CHILD_PROCESS_ID, "COMPLETED"));
                     })
+                .done()
+          },
+          {
+            "parallel gateway",
+            scenario()
+                .deployWorkflow(
+                    Bpmn.createExecutableProcess(PROCESS_ID)
+                        .startEvent()
+                        .parallelGateway("fork")
+                        .serviceTask(TASK, t -> t.zeebeJobType(TASK))
+                        .parallelGateway("join")
+                        .moveToNode("fork")
+                        .sequenceFlowId("to-join")
+                        .connectTo("join")
+                        .endEvent()
+                        .done())
+                .createInstance()
+                .beforeUpgrade(UpgradeTest::activateJob)
+                .afterUpgrade(UpgradeTest::completeJob)
+                .done()
+          },
+          {
+            "exclusive gateway",
+            scenario()
+                .deployWorkflow(
+                    Bpmn.createExecutableProcess(PROCESS_ID)
+                        .startEvent()
+                        .exclusiveGateway()
+                        .sequenceFlowId("s1")
+                        .conditionExpression("x > 5")
+                        .serviceTask(TASK, t -> t.zeebeJobType(TASK))
+                        .endEvent()
+                        .moveToLastExclusiveGateway()
+                        .sequenceFlowId("s2")
+                        .defaultFlow()
+                        .serviceTask("other-task", t -> t.zeebeJobType("other-task"))
+                        .endEvent()
+                        .done())
+                .createInstance(Map.of("x", 10))
+                .beforeUpgrade(UpgradeTest::activateJob)
+                .afterUpgrade(UpgradeTest::completeJob)
                 .done()
           }
         });
@@ -195,9 +291,24 @@ public class UpgradeTest {
     state.close();
     final File snapshot = new File(tmpFolder.getRoot(), "raft-partition/partitions/1/snapshots/");
 
-    assertThat(snapshot).exists();
+    Awaitility.await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () ->
+                assertThat(snapshot)
+                    .describedAs("Expected that a snapshot is created")
+                    .exists()
+                    .isNotEmptyDirectory());
+
     if (deleteSnapshot) {
-      Files.delete(snapshot);
+
+      try {
+        FileUtil.deleteFolder(snapshot.toPath());
+      } catch (final IOException e) {
+        e.printStackTrace();
+      }
+
+      assertThat(snapshot).describedAs("Expected that the snapshot is deleted").doesNotExist();
     }
 
     // then
@@ -253,6 +364,7 @@ public class UpgradeTest {
         .messageName(MESSAGE)
         .correlationKey("123")
         .timeToLive(Duration.ofMinutes(5))
+        .variables(Map.of("x", 1))
         .send()
         .join();
 
